@@ -1,0 +1,25 @@
+minion-4gb:
+  - james-es-master-1:
+      grains:
+        roles:
+          - elasticsearch-master
+
+  - james-es-client-1:
+      grains:
+        roles:
+          - elasticsearch-client
+
+  - james-es-data-1:
+      grains:
+        roles:
+          - elasticsearch-data
+
+  - james-es-data-2:
+      grains:
+        roles:
+          - elasticsearch-data
+
+  - james-es-data-3:
+      grains:
+        roles:
+          - elasticsearch-data
