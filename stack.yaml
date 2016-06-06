@@ -1,0 +1,544 @@
+heat_template_version: 2015-04-30
+
+description: |
+  Heat template for elasticsearch.
+  Deploys a single elasticsearch master node.
+  Deploys a variable number of elasticsearch client nodes.
+  Deploys a variable number of elasticsearch data nodes.
+  salt-master will run on the elasticsearch master node.
+
+parameter_groups:
+  - label: Sizing and location
+    description: What networks and how large of a vm.
+    parameters:
+      - keyname
+      - image
+      - flavor
+      - apps-network
+      - client-node-count
+      - data-node-count
+
+  - label: Don't touch
+    description: These parameters should be left default except in special cases.
+    parameters:
+      - git-formula-repo
+
+parameters:
+
+  keyname:
+    type: string
+    label: SSH Keypair name.
+    description: Name of the ssh key used to ssh into mysql server.
+
+  image:
+    type: string
+    label: Image Name
+    description: Name of the trusty image that contains software config heat elements.
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Flavor (size) for all virtual machines in this stack.
+    default: m1.small
+
+  apps-network:
+    type: string
+    label: Apps Network Name or UUID
+    description: Existing private network that is routable to a public network.
+    default: changeme
+
+  data-node-count:
+    type: number
+    default: 4
+    label: Number of Elasticsearch Data Nodes.
+    description: Number of nodes that will be responsible for indexing data.
+
+  client-node-count:
+    type: number
+    default: 2
+    label: Number of Elasticsearch Client Nodes.
+    description: Number of nodes that will be responsible for querying data.
+
+  git-formula-repo:
+    type: string
+    label: Elasticsearch Formula Repo
+    description: Formula git repository. This should remain as default except for development.
+    default: https://github.com/rcbops/RPC-Heat-Elasticsearch.git
+
+resources:
+
+  # Security group
+  secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        str_replace:
+          template: elasticsearch-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+      rules:
+        # SSH
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        # Salt
+        - protocol: tcp
+          port_range_min: 4505
+          port_range_max: 4506
+        # ES Http
+        - protocol: tcp
+          port_range_min: 9200
+          port_range_max: 9200
+        # ES Transport
+        - protocol: tcp
+          port_range_min: 9300
+          port_range_max: 9300
+
+  # Keypair for communicating between nodes within the stack.
+  # Will allow minions to ssh into the master and vice versa.
+  coms:
+    type: OS::Nova::KeyPair
+    properties:
+      save_private_key: true
+      name:
+        str_replace:
+          template: elasticsearch-key-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+
+  # One port for the elasticsearch-master/salt-master node
+  master-port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        str_replace:
+          template: elasticsearch-master-port-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+      network_id:
+        get_param: apps-network
+      security_groups:
+        - get_resource: secgroup
+
+  # Software configuration script for the salt-master
+  config-salt-master:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: git_formula_repo
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-master
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+
+        [ -e ${prefix}.ran ] && exit 0
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+        chmod 0600 /srv/pillar/elasticsearch.sls
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install salt-master and git
+        echo "Install Salt Master"
+        add-apt-repository -y ppa:saltstack/salt2015-5
+        apt-get update
+        apt-get install -y --force-yes git salt-master
+
+        mkdir -p /srv/salt
+        echo -e 'file_roots:\n  base:\n    - /srv/salt' >> /etc/salt/master
+
+        git clone "${git_formula_repo}" /srv/salt/elasticsearch
+
+        # Finally - Restart salt service
+        service salt-master restart
+
+  # Software configuration for the salt minion.
+  # Installs salt minion and connects minion to master.
+  config-salt-minion:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: master
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-minion
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install salt minion
+        add-apt-repository -y ppa:saltstack/salt2015-5
+        apt-get update
+        apt-get install -y --force-yes git salt-minion
+
+        echo master: $master >> /etc/salt/minion
+        service salt-minion restart
+
+        ssh-keyscan -H $master >> /root/.ssh/known_hosts
+
+        MASTER_PKI_PATH="/etc/salt/pki/master/minions/"
+        MASTER_PKI_PATH_PRE="/etc/salt/pki/master/minions_pre/"
+        MINION_PKI_PATH="/etc/salt/pki/minion/minion.pub"
+        HOSTNAME="$(python  -c 'import socket; print socket.getfqdn()')"
+
+        while [ ! -s ${MINION_PKI_PATH} ]; do
+            echo "Waiting for ${MINION_PKI_PATH} to have non-zero content."
+            sleep 2
+        done
+
+        cp $MINION_PKI_PATH /root/minion_key
+        scp -i /root/.ssh/coms_rsa /root/minion_key root@$master:/tmp/$HOSTNAME
+        ssh -i /root/.ssh/coms_rsa root@$master "mv /tmp/$HOSTNAME $MASTER_PKI_PATH$HOSTNAME; chmod 700 $MASTER_PKI_PATH$HOSTNAME"
+        rm /root/minion_key
+        if [ ! -f /etc/salt/master ]; then
+            rm /root/.ssh/coms_rsa
+        fi
+        service salt-minion restart
+        touch ${prefix}.ran
+
+  # Software deployment for salt-master. Deploys the salt-master software
+  # configuration.
+  deploy-salt-master:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      input_values:
+        master:
+          get_attr:
+             - master
+             - first_address
+        git_formula_repo:
+          get_param: git-formula-repo
+      config:
+        get_resource: config-salt-master
+      server:
+        get_resource: master
+
+  # The salt master instance
+  # Should have one floating ip
+  master:
+    type: OS::Nova::Server
+    properties:
+      key_name:
+        get_param: keyname
+      image:
+        get_param: image
+      flavor:
+        get_param: flavor
+      name:
+        str_replace:
+          template: elasticsearch-master-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+
+      personality:
+        # Private key for ssh'ing into minions
+        /root/.ssh/coms_rsa:
+          get_attr:
+            - coms
+            - private_key
+
+        # The top.sls file for salt pillars.
+        # Dictates which minions get which pillars
+        /srv/pillar/top.sls: |
+          base:
+           'roles:elasticsearch-data':
+             - match: grain
+             - elasticsearch
+           'roles:elasticsearch-client':
+             - match: grain
+             - elasticsearch
+           'roles:elasticsearch-master':
+             - match: grain
+             - elasticsearch
+
+        # The top.sls file for salt states.
+        # Dictates which minions get which states.
+        /srv/salt/top.sls: |
+          base:
+            'roles:elasticsearch-client':
+              - match: grain
+              - elasticsearch.elasticsearch
+            'roles:elasticsearch-master':
+              - match: grain
+              - elasticsearch.elasticsearch
+            'roles:elasticsearch-data':
+              - match: grain
+              - elasticsearch.elasticsearch
+
+        # Set the salt grain for roles
+        /etc/salt/grains: |
+          roles:
+            - elasticsearch-master
+
+        # The app pillar. Describe interfaces and salt-mine functions.
+        /srv/pillar/elasticsearch.sls: |
+          elasticsearch:
+            user: elasticsearch
+            group: elasticsearch
+            download_url: https://download.elasticsearch.org/elasticsearch/elasticsearch
+            version: 1.4.2
+            md5: 70bbd1d63c91c71251012e7d8553e39d
+            apt_pkgs:
+              - htop
+              - ntp
+              - unzip
+
+            max_open_files: 65535
+            max_locked_memory: unlimited
+
+            home_dir: /usr/share/elasticsearch
+            plugin_dir: /usr/share/elasticsearch/plugins
+            log_dir: /var/log/elasticsearch
+            data_dir: /var/lib/elasticsearch
+            work_dir: /tmp/elasticsearch
+            conf_dir: /etc/elasticsearch
+
+            service_startonboot: no
+            service_state: started
+            network_transport_tcp_port: 9300
+            network_http_port: 9200
+
+            discovery_zen_minimum_master_nodes: 1
+            discovery_zen_ping_timeout: 30s
+
+            auto_create_index: True
+            disable_delete_all_indices: True
+            query_bool_max_clause_count: 4096
+            java_opts: "-XX:-UseSuperWord"
+
+          interfaces:
+            public: eth0
+            private: eth0
+
+          mine_functions:
+            internal_ips:
+              mine_function: network.ipaddrs
+              interface: eth0
+            external_ips:
+              mine_function: network.ipaddrs
+              interface: eth0
+            id:
+              - mine_function: grains.get
+              - id
+            host:
+              - mine_function: grains.get
+              - host
+
+          user-ports:
+            ssh:
+              chain: INPUT
+              proto: tcp
+              dport: 22
+            salt-master:
+              chain: INPUT
+              proto: tcp
+              dport: 4505
+            salt-minion:
+              chain: INPUT
+              proto: tcp
+              dport: 4506
+            es-http:
+              chain: INPUT
+              proto: tcp
+              dport: 9200
+            es-transport:
+              chain: INPUT
+              proto: tcp
+              dport: 9300
+
+      # Get access from the master-port
+      networks:
+        - port:
+            get_resource: master-port
+
+      # Using SoftwareConfigs - This needs to be set to SOFTWARE_CONFIG
+      user_data_format: SOFTWARE_CONFIG
+
+  # Deploys the salt-minion software config to the elasticsearch master node.
+  deploy-salt-minion-master:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: deploy-salt-master
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        master:
+          get_attr:
+            - master
+            - first_address
+      config:
+        get_resource: config-salt-minion
+      server:
+        get_resource: master
+
+  client-servers:
+    type: OS::Heat::ResourceGroup
+    depends_on: deploy-salt-master
+    properties:
+      count:
+        get_param: client-node-count
+      resource_def:
+        type: Salt::ElasticsearchMinion
+        properties:
+          flavor:
+            get_param: flavor
+          stack-prefix:
+            str_replace:
+              template: elasticsearch-client-$stack_name$
+              params:
+                $stack_name$:
+                  get_param: OS::stack_name
+          private_key:
+            get_attr:
+              - coms
+              - private_key
+          public_key:
+            get_attr:
+              - coms
+              - public_key
+          image:
+            get_param: image
+          network:
+            get_param: apps-network
+          master:
+            get_attr:
+              - master
+              - first_address
+          minion-config:
+            get_resource: config-salt-minion
+          minion-roles: "elasticsearch-client"
+          security-group:
+            get_resource: secgroup
+
+  data-servers:
+    type: OS::Heat::ResourceGroup
+    depends_on: deploy-salt-master
+    properties:
+      count:
+        get_param: data-node-count
+      resource_def:
+        type: Salt::ElasticsearchMinion
+        properties:
+          flavor:
+            get_param: flavor
+          stack-prefix:
+            str_replace:
+              template: elasticsearch-data-$stack_name$
+              params:
+                $stack_name$:
+                  get_param: OS::stack_name
+          private_key:
+            get_attr:
+              - coms
+              - private_key
+          public_key:
+            get_attr:
+              - coms
+              - public_key
+          image:
+            get_param: image
+          network:
+            get_param: apps-network
+          master:
+            get_attr:
+              - master
+              - first_address
+          minion-config:
+            get_resource: config-salt-minion
+          minion-roles: "elasticsearch-data"
+          security-group:
+            get_resource: secgroup
+
+  config-deploy:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-deploy
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+        salt-run state.orchestrate elasticsearch.runner
+        sleep 90
+        salt '*' test.ping
+        salt '*' state.sls elasticsearch.test
+        touch ${prefix}.ran
+
+  deploy:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: config-deploy
+      server:
+        get_resource: master
+    depends_on:
+      - deploy-salt-master
+      - deploy-salt-minion-master
+      - client-servers
+      - data-servers
+
+outputs:
+  master-ip:
+    description: The ip address of the Elasticsearch master/salt-master server.
+    value:
+      get_attr:
+        - master
+        - first_address
+
+  elasticsearch-http-port:
+    description: The port for elasticsearch HTTP access.
+    value: 9200
+
+  elasticsearch-transport-port:
+    description: The port for non HTTP elasticsearch access.
+    value: 9300
+
+  elasticsearch-client-ips:
+    description: IP addresses of the elasticsearch client servers.
+    value:
+      get_attr:
+        - client-servers
+        - minion-ip
+
+  elasticsearch-data-ips:
+    description: IP addresses of the elasticsearch client servers.
+    value:
+      get_attr:
+        - data-servers
+        - minion-ip
+
+  ssh_access:
+    description: How to ssh into the stack.
+    value:
+      str_replace:
+        template: ssh ubuntu@$master-ip$
+        params:
+          $master-ip$:
+            get_attr:
+              - master
+              - first_address

@@ -1,3 +1,8 @@
+debconf-utils:
+  pkg.installed:
+    - require_in:
+      - debconf: debconf-oracle-select
+
 python-software-properties:
   pkg.installed:
     - require_in:
