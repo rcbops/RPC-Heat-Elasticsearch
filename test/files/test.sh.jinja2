@@ -1,0 +1,22 @@
+{%- set client_ip = salt['mine.get']('roles:elasticsearch-client', 'internal_ips', 'grain').values()|first|first -%}
+{%- set http_port = salt['pillar.get']('elasticsearch:network_http_port', 9200) -%}
+#!/bin/bash
+
+echo "Testing cluster status"
+curl http://{{ client_ip }}:{{ http_port }}/_cluster/health?pretty=true
+
+INDEX_NAME='test_index'
+TYPE_NAME='test_type'
+echo "Creating index test"
+curl -XPUT http://{{ client_ip }}:{{ http_port }}/${INDEX_NAME}?pretty
+
+echo "Listing indices"
+curl http://{{ client_ip }}:{{ http_port }}/_cat/indices?v
+
+echo "Creating document"
+curl -XPOST http://{{ client_ip }}:{{ http_port }}/$INDEX_NAME/$TYPE_NAME?pretty -d '{"somefield": "somevalue"}'
+
+sleep 2
+
+echo "Listing indices"
+curl http://{{ client_ip }}:{{ http_port }}/_cat/indices?v

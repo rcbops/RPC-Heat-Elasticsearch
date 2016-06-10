@@ -1,0 +1,117 @@
+{% set private_interface = salt['pillar.get']('interfaces:private', 'eth0') %}
+{% set private_ip = salt['network.ipaddrs'](private_interface)[0] %}
+{% set public_interface = salt['pillar.get']('interfaces:public', 'eth0') %}
+{% set public_ip = salt['network.ipaddrs'](public_interface)[0] %}
+{% set p = salt['pillar.get']('elasticsearch') %}
+
+{% set log_dir = p.get('log_dir', '/var/log/elasticsearch') %}
+{% set data_dir = p.get('data_dir', '/var/lib/elasticsearch') %}
+{% set work_dir = p.get('word_dir', '/tmp/elasticsearch') %}
+{% set conf_dir = p.get('conf_dir', '/etc/elasticsearch') %}
+{% set plugin_dir = p.get('plugin_dir', '/usr/share/elasticsearch/plugins') %}
+{% set dirs = [
+    log_dir,
+    data_dir,
+    work_dir,
+    conf_dir,
+    plugin_dir
+] %}
+
+{% set roles = salt['grains.get']('roles', []) %}
+{% set datas = salt['mine.get']('roles:elasticsearch-data', 'host', 'grain') %}
+{% set number_of_shards = datas|length %}
+{% set number_of_replicas = p.get('number_of_replicas', 1) %}
+
+{% set is_client = 'elasticsearch-client' in roles %}
+{% set is_master = 'elasticsearch-master' in roles %}
+{% set is_data = 'elasticsearch-data' in roles %}
+
+{% set network_transport_tcp_port = p.get('network_transport_tcp_port', 9300) %}
+{% set network_bind_host = [private_ip] %}
+{% set network_http_enabled = False %}
+{% set http_cors_enabled = False %}
+{% if is_client %}
+    {% do network_bind_host.append('localhost') %}
+    {% if public_ip != private_ip %}
+        {% do network_bind_host.append(public_ip) %}
+    {% endif %}
+    {% set network_http_enabled = True %}
+    {% set http_cors_enabled = True %}
+{% endif %}
+
+{% set network_publish_host = [private_ip] %}
+
+{% set masters = salt['mine.get']('roles:elasticsearch-master', 'internal_ips', 'grain') %}
+{% set discovery_zen_ping_unicast_hosts = [] %}
+{% for master, ips in masters.items() %}
+    {% set unicast_host = [ips[0], network_transport_tcp_port]|join(':') %}
+    {% do discovery_zen_ping_unicast_hosts.append(unicast_host) %}
+{% endfor %}
+
+{% set os_processors = p.get('os_processors', salt['grains.get']('num_cpus')) %}
+# Set memory in MB
+{% set total_mem = (salt['grains.get']('mem_total'))|int %}
+{% set rec_heap_size = (total_mem * 0.5)|int %}
+{% if rec_heap_size > 30270 %}
+    {% set rec_heap_size = 30270 %}
+{% endif %}
+{% set heap_size = p.get('heap_size', '' + rec_heap_size|string + 'm') %}
+
+{% set elasticsearch = {
+    'cluster_name': p.get('cluster_name', 'elasticsearch'),
+    'node_name': salt['grains.get']('host'),
+
+    'is_master': 'elasticsearch-master' in roles,
+    'is_data': 'elasticsearch-data' in roles,
+    'is_client': is_client,
+
+    'number_of_shards': number_of_shards,
+    'number_of_replicas': number_of_replicas,
+
+    'network_bind_host': network_bind_host,
+    'network_publish_host': network_publish_host,
+    'network_transport_tcp_port': network_transport_tcp_port,
+    'network_http_enabled': network_http_enabled,
+
+    'http_cors_enabled': http_cors_enabled,
+
+    'apt_pkgs': p.get('apt_pkgs', ['htop', 'ntp', 'unzip']),
+    'user': p.get('user', 'elasticsearch'),
+    'group': p.get('group', 'elasticsearch'),
+    'download_url': p.get('download_url', 'https://download.elasticsearch.org/elasticsearch/elasticsearch'),
+    'version': p.get('version', '1.4.2'),
+    'md5': p.get('md5', 'something'),
+
+    'log_dir': log_dir,
+    'data_dir': data_dir,
+    'work_dir': work_dir,
+    'conf_dir': conf_dir,
+    'plugin_dir': plugin_dir,
+    'dirs': dirs,
+
+    'discovery_zen_minimum_master_nodes': p.get('discovery_zen_minimum_master_nodes', 1),
+    'discovery_zen_ping_timeout': p.get('discovery_zen_ping_timeout', '30s'),
+    'discovery_zen_ping_unicast_hosts': discovery_zen_ping_unicast_hosts,
+
+    'auto_create_index': p.get('auto_create_index', True),
+    'disable_delete_all_indices': p.get('disable_delete_all_indices', True),
+    'query_bool_max_clause_count': p.get('query_bool_max_clause_count', 4096),
+    'java_opts': p.get('java_opts', '-XX:-UseSuperWord'),
+
+    'os_processors': os_processors,
+    'heap_size': heap_size
+} %}
+
+{% set max_open_files = p.get('max_open_files') %}
+{% if max_open_files %}
+    {% do elasticsearch.update({'max_open_files': max_open_files}) %}
+{% endif %}
+
+{% set max_locked_memory = p.get('max_locked_memory') %}
+{% if max_locked_memory %}
+    {% do elasticsearch.update({'max_locked_memory': max_locked_memory}) %}
+{% endif %}
+
+{% if is_client %}
+    {% do elasticsearch.update({'network_http_port': p.get('network_http_port', 9200)}) %}
+{% endif %}
